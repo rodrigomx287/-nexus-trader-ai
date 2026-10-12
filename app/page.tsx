@@ -1,1113 +1,421 @@
+
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  createChart,
   CandlestickSeries,
   ColorType,
+  createChart,
 } from "lightweight-charts";
 
-const markets = [
-  "XAUUSD",
-  "EURUSD",
-  "GBPUSD",
-  "USDJPY",
-  "US100",
-  "US500",
-];
-
-const scanners = [
-  { name: "Trend Scanner", type: "TREND" },
-  { name: "Breakout Scanner", type: "BREAKOUT" },
-  { name: "Reversal Scanner", type: "REVERSAL" },
-  { name: "Liquidity Scanner", type: "LIQUIDITY" },
-];
-
-const timeframes = ["M1", "M3", "M4", "M15", "M30"];
-
-const basePrices: Record<string, number> = {
-  XAUUSD: 4145,
-  EURUSD: 1.175,
-  GBPUSD: 1.345,
-  USDJPY: 147.5,
-  US100: 24500,
-  US500: 6750,
+type Candle = {
+  time: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
 };
 
-const symbolMap: Record<string, string> = {
-  XAUUSD: "XAU/USD",
-  EURUSD: "EUR/USD",
-  GBPUSD: "GBP/USD",
-  USDJPY: "USD/JPY",
-  US100: "NDX",
-  US500: "SPX",
+type Analysis = {
+  trend: string;
+  signal: string;
+  detail: string;
+  last?: number;
+  resistance?: number;
+  support?: number;
 };
 
-function buildAggregatedCandles(values: any[], minutes: number) {
-  const sorted = [...values]
-    .map((item) => ({
-      timestamp: Math.floor(
-        new Date(item.datetime).getTime() / 1000
-      ),
-      open: Number(item.open),
-      high: Number(item.high),
-      low: Number(item.low),
-      close: Number(item.close),
-    }))
-    .filter(
-      (item) =>
-        Number.isFinite(item.open) &&
-        Number.isFinite(item.high) &&
-        Number.isFinite(item.low) &&
-        Number.isFinite(item.close)
-    )
-    .sort((a, b) => a.timestamp - b.timestamp);
+const SYMBOLS = [
+  { label: "ORO · XAU/USD", value: "XAU/USD" },
+  { label: "EUR/USD", value: "EUR/USD" },
+  { label: "GBP/USD", value: "GBP/USD" },
+  { label: "BTC/USD", value: "BTC/USD" },
+];
 
-  const groups: Record<number, any> = {};
+const TIMEFRAMES = [
+  { label: "M1", minutes: 1 },
+  { label: "M3", minutes: 3 },
+  { label: "M4", minutes: 4 },
+];
 
-  for (const candle of sorted) {
-    const bucket =
-      Math.floor(candle.timestamp / (minutes * 60)) *
-      (minutes * 60);
+function aggregateCandles(candles: Candle[], minutes: number): Candle[] {
+  if (minutes === 1) return candles;
 
-    if (!groups[bucket]) {
-      groups[bucket] = {
-        time: bucket,
-        open: candle.open,
-        high: candle.high,
-        low: candle.low,
-        close: candle.close,
-      };
+  const groups = new Map<number, Candle>();
+  const seconds = minutes * 60;
+
+  for (const candle of candles) {
+    const bucket = Math.floor(candle.time / seconds) * seconds;
+    const existing = groups.get(bucket);
+
+    if (!existing) {
+      groups.set(bucket, { ...candle, time: bucket });
     } else {
-      groups[bucket].high = Math.max(
-        groups[bucket].high,
-        candle.high
-      );
-
-      groups[bucket].low = Math.min(
-        groups[bucket].low,
-        candle.low
-      );
-
-      groups[bucket].close = candle.close;
+      existing.high = Math.max(existing.high, candle.high);
+      existing.low = Math.min(existing.low, candle.low);
+      existing.close = candle.close;
     }
   }
 
-  return Object.values(groups);
+  return Array.from(groups.values()).sort((a, b) => a.time - b.time);
 }
 
-function TradingChart({
-  market,
-  timeframe,
-}: {
-  market: string;
-  timeframe: string;
-}) {
-  const chartContainerRef = useRef<HTMLDivElement | null>(null);
-
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState("");
-
-  useEffect(() => {
-    if (!chartContainerRef.current) return;
-
-    const container = chartContainerRef.current;
-
-    const chart = createChart(container, {
-      width: container.clientWidth,
-      height: 360,
-
-      layout: {
-        background: {
-          type: ColorType.Solid,
-          color: "#080b10",
-        },
-        textColor: "#8b95a7",
-      },
-
-      grid: {
-        vertLines: {
-          color: "#151a23",
-        },
-        horzLines: {
-          color: "#151a23",
-        },
-      },
-
-      rightPriceScale: {
-        borderColor: "#252b36",
-      },
-
-      timeScale: {
-        borderColor: "#252b36",
-        timeVisible: true,
-        secondsVisible: false,
-      },
-
-      crosshair: {
-        mode: 1,
-      },
-    });
-
-    const series = chart.addSeries(CandlestickSeries, {
-      upColor: "#22c55e",
-      downColor: "#ef4444",
-
-      borderUpColor: "#22c55e",
-      borderDownColor: "#ef4444",
-
-      wickUpColor: "#22c55e",
-      wickDownColor: "#ef4444",
-    });
-
-    const loadMarketData = async () => {
-      try {
-        setLoading(true);
-        setError("");
-
-        const symbol =
-          symbolMap[market] || "XAU/USD";
-
-        /*
-          M1, M3 y M4:
-          Usamos M1 como fuente y construimos
-          M3/M4 agrupando las velas.
-
-          M15/M30:
-          Se solicitan directamente.
-        */
-
-        let sourceInterval = "1min";
-
-        if (timeframe === "M15") {
-          sourceInterval = "15min";
-        }
-
-        if (timeframe === "M30") {
-          sourceInterval = "30min";
-        }
-
-        const response = await fetch(
-          `/api/market?symbol=${encodeURIComponent(
-            symbol
-          )}&interval=${encodeURIComponent(
-            sourceInterval
-          )}`
-        );
-
-        const data = await response.json();
-
-        if (!response.ok || data.error) {
-          throw new Error(
-            data.error ||
-              "No se pudieron obtener los datos"
-          );
-        }
-
-        if (
-          !data.values ||
-          data.values.length === 0
-        ) {
-          throw new Error(
-            "Twelve Data no devolvió velas"
-          );
-        }
-
-        let candles;
-
-        if (
-          timeframe === "M3" ||
-          timeframe === "M4"
-        ) {
-          const minutes =
-            timeframe === "M3" ? 3 : 4;
-
-          candles = buildAggregatedCandles(
-            data.values,
-            minutes
-          );
-        } else {
-          candles = [...data.values]
-            .reverse()
-            .map((item: any) => ({
-              time: Math.floor(
-                new Date(
-                  item.datetime
-                ).getTime() / 1000
-              ) as any,
-
-              open: Number(item.open),
-              high: Number(item.high),
-              low: Number(item.low),
-              close: Number(item.close),
-            }))
-            .filter(
-              (item) =>
-                Number.isFinite(item.open) &&
-                Number.isFinite(item.high) &&
-                Number.isFinite(item.low) &&
-                Number.isFinite(item.close)
-            );
-        }
-
-        if (!candles.length) {
-          throw new Error(
-            "No hay suficientes velas para mostrar"
-          );
-        }
-
-        series.setData(candles as any);
-
-        chart.timeScale().fitContent();
-
-        setLoading(false);
-      } catch (err) {
-        console.error(err);
-
-        setError(
-          err instanceof Error
-            ? err.message
-            : "Error cargando datos"
-        );
-
-        setLoading(false);
-      }
+function analyze(candles: Candle[]): Analysis {
+  if (candles.length < 25) {
+    return {
+      trend: "DATOS INSUFICIENTES",
+      signal: "ESPERAR",
+      detail: "Se necesitan al menos 25 velas válidas.",
     };
+  }
 
-    loadMarketData();
+  const closes = candles.map((c) => c.close);
+  const last = closes[closes.length - 1];
 
-    const resizeObserver =
-      new ResizeObserver(() => {
-        if (!chartContainerRef.current) {
-          return;
-        }
+  function ema(period: number): number {
+    const k = 2 / (period + 1);
+    let value = closes[0];
 
-        chart.applyOptions({
-          width:
-            chartContainerRef.current
-              .clientWidth,
-        });
-      });
+    for (const price of closes.slice(1)) {
+      value = price * k + value * (1 - k);
+    }
 
-    resizeObserver.observe(container);
+    return value;
+  }
 
-    return () => {
-      resizeObserver.disconnect();
-      chart.remove();
-    };
-  }, [market, timeframe]);
+  const fast = ema(9);
+  const slow = ema(21);
+  const recent = candles.slice(-5);
+  const rising = recent[recent.length - 1].close > recent[0].open;
+  const falling = recent[recent.length - 1].close < recent[0].open;
 
-  return (
-    <div
-      style={{
-        marginTop: "20px",
-        borderRadius: "12px",
-        overflow: "hidden",
-        border: "1px solid #1b212c",
-      }}
-    >
-      <div
-        style={{
-          padding: "10px 14px",
-          background: "#0b0f15",
-          color: "#777f8d",
-          fontSize: "12px",
-          borderBottom:
-            "1px solid #1b212c",
-        }}
-      >
-        {market} · {timeframe} · Candlestick Chart ·{" "}
-        {loading
-          ? "Cargando datos..."
-          : "Datos reales"}
-      </div>
+  let trend = "LATERAL";
+  let signal = "ESPERAR";
+  let detail = "No hay confirmación suficiente para una entrada.";
 
-      {error && (
-        <div
-          style={{
-            padding: "12px 14px",
-            background: "#160d0d",
-            color: "#ef7777",
-            fontSize: "13px",
-          }}
-        >
-          {error}
-        </div>
-      )}
+  if (fast > slow && last > fast) {
+    trend = "ALCISTA";
 
-      <div
-        ref={chartContainerRef}
-        style={{
-          width: "100%",
-          height: "360px",
-          background: "#080b10",
-        }}
-      />
-    </div>
-  );
-}
+    if (rising) {
+      signal = "POSIBLE COMPRA";
+      detail = "Tendencia alcista e impulso reciente. Espera confirmación.";
+    }
+  } else if (fast < slow && last < fast) {
+    trend = "BAJISTA";
 
-function calculateSignal(
-  market: string,
-  timeframe: string
-) {
-  const base =
-    basePrices[market] || 100;
+    if (falling) {
+      signal = "POSIBLE VENTA";
+      detail = "Tendencia bajista e impulso reciente. Espera confirmación.";
+    }
+  }
 
-  const isBuy =
-    Math.random() > 0.5;
-
-  const entry =
-    base +
-    (Math.random() - 0.5) *
-      base *
-      0.002;
-
-  /*
-    SL relativamente corto.
-    TP más amplio para buscar
-    una relación aproximada de 1:2.5.
-  */
-
-  const risk = base * 0.001;
-
-  const stopLoss = isBuy
-    ? entry - risk
-    : entry + risk;
-
-  const tp1 = isBuy
-    ? entry + risk * 1.5
-    : entry - risk * 1.5;
-
-  const tp2 = isBuy
-    ? entry + risk * 2.5
-    : entry - risk * 2.5;
+  const recentCandles = candles.slice(-20);
 
   return {
-    direction: isBuy ? "BUY" : "SELL",
-    entry,
-    stopLoss,
-    tp1,
-    tp2,
-    timeframe,
+    trend,
+    signal,
+    detail,
+    last,
+    resistance: Math.max(...recentCandles.map((c) => c.high)),
+    support: Math.min(...recentCandles.map((c) => c.low)),
   };
 }
 
 export default function Home() {
-  const [market, setMarket] =
-    useState("XAUUSD");
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const chartRef = useRef<any>(null);
+  const seriesRef = useRef<any>(null);
 
-  const [timeframe, setTimeframe] =
-    useState("M5");
+  const [symbol, setSymbol] = useState("XAU/USD");
+  const [timeframe, setTimeframe] = useState(1);
+  const [candles, setCandles] = useState<Candle[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [updatedAt, setUpdatedAt] = useState("");
+  const [refreshCount, setRefreshCount] = useState(30);
 
-  const [scanner, setScanner] =
-    useState("TREND");
+  const loadData = useCallback(async () => {
+    try {
+      setError("");
 
-  const [signal, setSignal] =
-    useState(() =>
-      calculateSignal(
-        "XAUUSD",
-        "M5"
-      )
+      const response = await fetch(
+        `/api/market?symbol=${encodeURIComponent(symbol)}&interval=1min`,
+        { cache: "no-store" }
+      );
+
+      const data = await response.json();
+
+      if (!response.ok || !Array.isArray(data.values)) {
+        throw new Error(data.error || "No se recibieron datos de mercado.");
+      }
+
+      const parsed: Candle[] = data.values
+        .map((item: Record<string, string>) => ({
+          time: Math.floor(
+            new Date(
+              item.datetime.includes("T")
+                ? item.datetime
+                : item.datetime.replace(" ", "T")
+            ).getTime() / 1000
+          ),
+          open: Number(item.open),
+          high: Number(item.high),
+          low: Number(item.low),
+          close: Number(item.close),
+        }))
+        .filter(
+          (c: Candle) =>
+            Number.isFinite(c.time) &&
+            Number.isFinite(c.open) &&
+            Number.isFinite(c.high) &&
+            Number.isFinite(c.low) &&
+            Number.isFinite(c.close) &&
+            c.high >= c.low
+        )
+        .sort((a: Candle, b: Candle) => a.time - b.time);
+
+      if (!parsed.length) {
+        throw new Error("La API no devolvió velas válidas.");
+      }
+
+      setCandles(aggregateCandles(parsed, timeframe));
+      setUpdatedAt(new Date().toLocaleTimeString());
+      setRefreshCount(30);
+    } catch (e) {
+      setError(
+        e instanceof Error ? e.message : "No se pudieron cargar los datos."
+      );
+    } finally {
+      setLoading(false);
+    }
+  }, [symbol, timeframe]);
+
+  useEffect(() => {
+    void loadData();
+
+    const timer = window.setInterval(() => {
+      void loadData();
+    }, 30000);
+
+    return () => window.clearInterval(timer);
+  }, [loadData]);
+
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+
+    const chart = createChart(container, {
+      autoSize: true,
+      layout: {
+        background: { type: ColorType.Solid, color: "#071426" },
+        textColor: "#9fb4d0",
+      },
+      grid: {
+        vertLines: { color: "#14253b" },
+        horzLines: { color: "#14253b" },
+      },
+      rightPriceScale: { borderColor: "#203651" },
+      timeScale: {
+        borderColor: "#203651",
+        timeVisible: true,
+        secondsVisible: false,
+      },
+    });
+
+    const series = chart.addSeries(CandlestickSeries, {
+      upColor: "#16c784",
+      downColor: "#ea3943",
+      borderUpColor: "#16c784",
+      borderDownColor: "#ea3943",
+      wickUpColor: "#16c784",
+      wickDownColor: "#ea3943",
+    });
+
+    chartRef.current = chart;
+    seriesRef.current = series;
+
+    return () => {
+      chart.remove();
+      chartRef.current = null;
+      seriesRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!seriesRef.current || candles.length === 0) return;
+
+    seriesRef.current.setData(
+      candles.map((c) => ({
+        time: c.time,
+        open: c.open,
+        high: c.high,
+        low: c.low,
+        close: c.close,
+      }))
     );
 
-  const generateSignal = () => {
-    setSignal(
-      calculateSignal(
-        market,
-        timeframe
-      )
-    );
-  };
+    chartRef.current?.timeScale().fitContent();
+  }, [candles]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      setRefreshCount((n) => (n <= 1 ? 30 : n - 1));
+    }, 1000);
+
+    return () => window.clearInterval(timer);
+  }, []);
+
+  const result = analyze(candles);
+
+  function money(value?: number) {
+    if (value === undefined) return "—";
+
+    return value.toLocaleString("en-US", {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 5,
+    });
+  }
 
   return (
-    <main
-      style={{
-        minHeight: "100vh",
-        background:
-          "linear-gradient(135deg,#05070a,#0b1018)",
-        color: "#f4f7fb",
-        padding: "24px",
-        fontFamily:
-          "Inter, system-ui, sans-serif",
-      }}
-    >
-      <div
-        style={{
-          maxWidth: "1400px",
-          margin: "0 auto",
-        }}
-      >
-        <header
-          style={{
-            display: "flex",
-            justifyContent:
-              "space-between",
-            alignItems: "center",
-            gap: "20px",
-            flexWrap: "wrap",
-          }}
-        >
+    <main className="min-h-screen bg-[#050d19] text-white">
+      <header className="border-b border-blue-900/60 bg-[#081629] px-4 py-4">
+        <div className="mx-auto flex max-w-7xl items-center justify-between gap-3">
           <div>
-            <div
-              style={{
-                fontSize: "12px",
-                color: "#22c55e",
-                fontWeight: 700,
-                letterSpacing: "2px",
-              }}
-            >
+            <div className="text-xs font-bold tracking-[0.28em] text-blue-400">
               NEXUS
             </div>
-
-            <h1
-              style={{
-                margin:
-                  "4px 0 0",
-                fontSize: "28px",
-              }}
-            >
-              TRADER AI
-            </h1>
-
-            <p
-              style={{
-                marginTop: "6px",
-                color: "#7f8998",
-              }}
-            >
-              Trading Analysis Platform
+            <h1 className="text-2xl font-black">TRADER AI</h1>
+            <p className="mt-1 text-xs text-slate-400">
+              Plataforma de análisis de mercado
             </p>
           </div>
 
-          <div
-            style={{
-              padding:
-                "10px 14px",
-              border:
-                "1px solid #1e2631",
-              borderRadius:
-                "10px",
-              background:
-                "#0b1017",
-              color:
-                "#22c55e",
-              fontSize: "13px",
-            }}
-          >
-            ● Market Data Connected
+          <div className="rounded-xl border border-blue-500/30 bg-blue-500/10 px-3 py-2 text-right">
+            <div className="text-[10px] text-blue-300">ACTUALIZACIÓN</div>
+            <div className="text-sm font-bold">{refreshCount}s</div>
           </div>
-        </header>
+        </div>
+      </header>
 
-        <section
-          style={{
-            marginTop: "28px",
-            display: "grid",
-            gridTemplateColumns:
-              "repeat(auto-fit,minmax(130px,1fr))",
-            gap: "10px",
-          }}
-        >
-          {markets.map(
-            (item) => (
-              <button
-                key={item}
-                onClick={() =>
-                  setMarket(item)
-                }
-                style={{
-                  padding:
-                    "14px 12px",
-                  borderRadius:
-                    "10px",
-                  border:
-                    item === market
-                      ? "1px solid #22c55e"
-                      : "1px solid #1d2530",
-                  background:
-                    item === market
-                      ? "#102217"
-                      : "#0b1017",
-                  color:
-                    item === market
-                      ? "#22c55e"
-                      : "#c5ccd6",
-                  cursor:
-                    "pointer",
-                  fontWeight: 700,
-                }}
-              >
-                {item}
-              </button>
-            )
-          )}
-        </section>
+      <div className="mx-auto max-w-7xl space-y-4 p-3 sm:p-5">
+        <section className="flex flex-wrap items-end gap-3 rounded-2xl border border-slate-800 bg-[#0a1728] p-4">
+          <label className="min-w-[180px] flex-1 text-xs text-slate-400">
+            ACTIVO
+            <select
+              value={symbol}
+              onChange={(e) => setSymbol(e.target.value)}
+              className="mt-2 block w-full rounded-lg border border-slate-700 bg-[#101f33] p-3 text-sm text-white"
+            >
+              {SYMBOLS.map((item) => (
+                <option key={item.value} value={item.value}>
+                  {item.label}
+                </option>
+              ))}
+            </select>
+          </label>
 
-        <section
-          style={{
-            marginTop: "20px",
-            display: "flex",
-            gap: "8px",
-            flexWrap: "wrap",
-          }}
-        >
-          {timeframes.map(
-            (item) => (
-              <button
-                key={item}
-                onClick={() =>
-                  setTimeframe(item)
-                }
-                style={{
-                  padding:
-                    "9px 16px",
-                  borderRadius:
-                    "8px",
-                  border:
-                    item === timeframe
-                      ? "1px solid #22c55e"
-                      : "1px solid #202832",
-                  background:
-                    item === timeframe
-                      ? "#122419"
-                      : "#0b1017",
-                  color:
-                    item === timeframe
-                      ? "#22c55e"
-                      : "#8e98a8",
-                  cursor:
-                    "pointer",
-                  fontWeight: 700,
-                }}
-              >
-                {item}
-              </button>
-            )
-          )}
-        </section>
-
-        <TradingChart
-          market={market}
-          timeframe={timeframe}
-        />
-
-        <section
-          style={{
-            marginTop: "24px",
-          }}
-        >
-          <h2
-            style={{
-              fontSize: "18px",
-              marginBottom: "12px",
-            }}
-          >
-            Market Scanners
-          </h2>
-
-          <div
-            style={{
-              display: "grid",
-              gridTemplateColumns:
-                "repeat(auto-fit,minmax(200px,1fr))",
-              gap: "10px",
-            }}
-          >
-            {scanners.map(
-              (item) => (
+          <div>
+            <div className="mb-2 text-xs text-slate-400">TEMPORALIDAD</div>
+            <div className="flex gap-2">
+              {TIMEFRAMES.map((item) => (
                 <button
-                  key={item.type}
-                  onClick={() =>
-                    setScanner(
-                      item.type
-                    )
-                  }
-                  style={{
-                    padding:
-                      "16px",
-                    textAlign:
-                      "left",
-                    borderRadius:
-                      "10px",
-                    border:
-                      scanner ===
-                      item.type
-                        ? "1px solid #22c55e"
-                        : "1px solid #1d2530",
-                    background:
-                      "#0b1017",
-                    color:
-                      scanner ===
-                      item.type
-                        ? "#22c55e"
-                        : "#c5ccd6",
-                    cursor:
-                      "pointer",
-                  }}
+                  key={item.minutes}
+                  onClick={() => setTimeframe(item.minutes)}
+                  className={`rounded-lg px-5 py-3 text-sm font-bold ${
+                    timeframe === item.minutes
+                      ? "bg-blue-600 text-white"
+                      : "border border-slate-700 bg-[#101f33] text-slate-300"
+                  }`}
                 >
-                  <strong>
-                    {item.name}
-                  </strong>
-
-                  <div
-                    style={{
-                      marginTop:
-                        "6px",
-                      fontSize:
-                        "12px",
-                      color:
-                        "#737d8c",
-                    }}
-                  >
-                    Scan {item.type.toLowerCase()} setups
-                  </div>
+                  {item.label}
                 </button>
-              )
-            )}
+              ))}
+            </div>
+          </div>
+
+          <button
+            onClick={() => void loadData()}
+            className="rounded-lg bg-blue-600 px-4 py-3 text-sm font-bold"
+          >
+            ↻ Actualizar
+          </button>
+        </section>
+
+        {error && (
+          <div className="rounded-xl border border-red-500/30 bg-red-950/40 p-3 text-sm text-red-200">
+            {error}
+          </div>
+        )}
+
+        <section className="overflow-hidden rounded-2xl border border-slate-800 bg-[#071426]">
+          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 px-4 py-3">
+            <div>
+              <h2 className="font-bold">{symbol}</h2>
+              <p className="text-xs text-slate-400">
+                Velas M{timeframe} · Twelve Data
+              </p>
+            </div>
+
+            <div className="text-right">
+              <div className="text-xs text-slate-400">ÚLTIMO CIERRE</div>
+              <div className="text-lg font-bold text-blue-300">
+                {candles.length
+                  ? money(candles[candles.length - 1].close)
+                  : "—"}
+              </div>
+            </div>
+          </div>
+
+          <div ref={containerRef} className="h-[360px] w-full sm:h-[480px]" />
+
+          <div className="border-t border-slate-800 px-4 py-3 text-xs text-slate-400">
+            {loading
+              ? "Cargando datos..."
+              : `Última consulta: ${updatedAt || "—"} · ${candles.length} velas`}
           </div>
         </section>
 
-        <section
-          style={{
-            marginTop: "24px",
-            display: "grid",
-            gridTemplateColumns:
-              "minmax(0,2fr) minmax(280px,1fr)",
-            gap: "16px",
-          }}
-        >
-          <div
-            style={{
-              background:
-                "#0b1017",
-              border:
-                "1px solid #1d2530",
-              borderRadius:
-                "14px",
-              padding:
-                "20px",
-            }}
-          >
-            <div
-              style={{
-                display:
-                  "flex",
-                justifyContent:
-                  "space-between",
-                alignItems:
-                  "center",
-                gap: "12px",
-                flexWrap:
-                  "wrap",
-              }}
-            >
-              <div>
-                <h2
-                  style={{
-                    margin: 0,
-                    fontSize:
-                      "20px",
-                  }}
-                >
-                  AI Market Analysis
-                </h2>
-
-                <p
-                  style={{
-                    color:
-                      "#778292",
-                    fontSize:
-                      "13px",
-                  }}
-                >
-                  {market} ·{" "}
-                  {timeframe} ·{" "}
-                  {scanner}
-                </p>
-              </div>
-
-              <button
-                onClick={
-                  generateSignal
-                }
-                style={{
-                  padding:
-                    "11px 16px",
-                  borderRadius:
-                    "9px",
-                  border:
-                    "none",
-                  background:
-                    "#22c55e",
-                  color:
-                    "#041008",
-                  fontWeight: 800,
-                  cursor:
-                    "pointer",
-                }}
-              >
-                Generate Signal
-              </button>
-            </div>
-
-            <div
-              style={{
-                marginTop:
-                  "22px",
-                padding:
-                  "18px",
-                borderRadius:
-                  "12px",
-                background:
-                  signal.direction ===
-                  "BUY"
-                    ? "#0c2115"
-                    : "#21100f",
-                border:
-                  signal.direction ===
-                  "BUY"
-                    ? "1px solid #1d6337"
-                    : "1px solid #63301d",
-              }}
-            >
-              <div
-                style={{
-                  fontSize:
-                    "26px",
-                  fontWeight: 900,
-                  color:
-                    signal.direction ===
-                    "BUY"
-                      ? "#22c55e"
-                      : "#ef4444",
-                }}
-              >
-                {signal.direction}
-              </div>
-
-              <div
-                style={{
-                  marginTop:
-                    "16px",
-                  display:
-                    "grid",
-                  gridTemplateColumns:
-                    "repeat(auto-fit,minmax(130px,1fr))",
-                  gap: "10px",
-                }}
-              >
-                <div>
-                  <small>
-                    ENTRY
-                  </small>
-                  <div>
-                    {signal.entry.toFixed(
-                      3
-                    )}
-                  </div>
-                </div>
-
-                <div>
-                  <small>
-                    SL
-                  </small>
-                  <div
-                    style={{
-                      color:
-                        "#ef7777",
-                    }}
-                  >
-                    {signal.stopLoss.toFixed(
-                      3
-                    )}
-                  </div>
-                </div>
-
-                <div>
-                  <small>
-                    TP1
-                  </small>
-                  <div
-                    style={{
-                      color:
-                        "#22c55e",
-                    }}
-                  >
-                    {signal.tp1.toFixed(
-                      3
-                    )}
-                  </div>
-                </div>
-
-                <div>
-                  <small>
-                    TP2
-                  </small>
-                  <div
-                    style={{
-                      color:
-                        "#22c55e",
-                    }}
-                  >
-                    {signal.tp2.toFixed(
-                      3
-                    )}
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            <div
-              style={{
-                marginTop:
-                  "18px",
-                color:
-                  "#9ba5b5",
-                lineHeight:
-                  1.7,
-                fontSize:
-                  "14px",
-              }}
-            >
-              <strong
-                style={{
-                  color:
-                    "#f1f5f9",
-                }}
-              >
-                AI Explanation
-              </strong>
-
-              <p>
-                Nexus Trader AI analiza
-                tendencia, estructura,
-                momentum, ruptura y
-                liquidez para identificar
-                posibles configuraciones.
-              </p>
-
-              <p>
-                El sistema busca una
-                entrada con riesgo
-                controlado y un objetivo
-                potencialmente mayor que
-                el riesgo asumido.
-              </p>
-
-              <p
-                style={{
-                  color:
-                    "#737e8e",
-                  fontSize:
-                    "12px",
-                }}
-              >
-                Las señales son análisis
-                informativo y no
-                garantizan resultados.
-              </p>
-            </div>
-          </div>
-
-          <div
-            style={{
-              background:
-                "#0b1017",
-              border:
-                "1px solid #1d2530",
-              borderRadius:
-                "14px",
-              padding:
-                "20px",
-            }}
-          >
-            <h2
-              style={{
-                marginTop: 0,
-              }}
-            >
-              Risk Management
-            </h2>
-
-            <div
-              style={{
-                display:
-                  "grid",
-                gap: "12px",
-              }}
-            >
-              <div
-                style={{
-                  padding:
-                    "14px",
-                  borderRadius:
-                    "10px",
-                  background:
-                    "#080d13",
-                }}
-              >
-                <small>
-                  TARGET R:R
-                </small>
-
-                <div
-                  style={{
-                    fontSize:
-                      "24px",
-                    fontWeight:
-                      800,
-                    color:
-                      "#22c55e",
-                    marginTop:
-                      "4px",
-                  }}
-                >
-                  1 : 2.5
-                </div>
-              </div>
-
-              <div
-                style={{
-                  padding:
-                    "14px",
-                  borderRadius:
-                    "10px",
-                  background:
-                    "#080d13",
-                }}
-              >
-                <small>
-                  STRATEGY
-                </small>
-
-                <div
-                  style={{
-                    marginTop:
-                      "5px",
-                  }}
-                >
-                  Short SL / Larger TP
-                </div>
-              </div>
-
-              <div
-                style={{
-                  padding:
-                    "14px",
-                  borderRadius:
-                    "10px",
-                    background:
-                      "#080d13",
-                }}
-              >
-                <small>
-                  TIMEFRAME
-                </small>
-
-                <div
-                  style={{
-                    marginTop:
-                      "5px",
-                  }}
-                >
-                  {timeframe}
-                </div>
-              </div>
-            </div>
-          </div>
-        </section>
-
-        <section
-          style={{
-            marginTop:
-              "24px",
-            padding:
-              "22px",
-            borderRadius:
-              "14px",
-            border:
-              "1px solid #1d2530",
-            background:
-              "#0b1017",
-          }}
-        >
-          <h2
-            style={{
-              marginTop: 0,
-            }}
-          >
-            Nexus Academy
+        <section>
+          <h2 className="mb-3 text-sm font-bold tracking-wider text-blue-300">
+            ANÁLISIS TÉCNICO
           </h2>
 
-          <p
-            style={{
-              color:
-                "#858f9f",
-              lineHeight:
-                1.6,
-            }}
-          >
-            Aprende análisis técnico,
-            estructura de mercado,
-            gestión de riesgo,
-            liquidez y lectura de
-            gráficos paso a paso.
-          </p>
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+            <article className="rounded-xl border border-slate-800 bg-[#0a1728] p-4">
+              <p className="text-xs text-slate-400">TENDENCIA · EMA 9/21</p>
+              <p className="mt-2 text-lg font-black">{result.trend}</p>
+            </article>
 
-          <div
-            style={{
-              display:
-                "grid",
-              gridTemplateColumns:
-                "repeat(auto-fit,minmax(180px,1fr))",
-              gap: "10px",
-              marginTop:
-                "16px",
-            }}
-          >
-            {[
-              "Level 1 · Basics",
-              "Level 2 · Structure",
-              "Level 3 · Liquidity",
-              "Level 4 · Advanced",
-            ].map(
-              (item) => (
-                <div
-                  key={item}
-                  style={{
-                    padding:
-                      "14px",
-                    borderRadius:
-                      "10px",
-                    background:
-                      "#080d13",
-                    border:
-                      "1px solid #18202a",
-                  }}
-                >
-                  {item}
-                </div>
-              )
-            )}
+            <article className="rounded-xl border border-slate-800 bg-[#0a1728] p-4">
+              <p className="text-xs text-slate-400">SEÑAL ORIENTATIVA</p>
+              <p className="mt-2 text-lg font-black text-blue-300">
+                {result.signal}
+              </p>
+              <p className="mt-2 text-xs leading-5 text-slate-400">
+                {result.detail}
+              </p>
+            </article>
+
+            <article className="rounded-xl border border-slate-800 bg-[#0a1728] p-4">
+              <p className="text-xs text-slate-400">RESISTENCIA · 20 VELAS</p>
+              <p className="mt-2 text-lg font-bold">
+                {money(result.resistance)}
+              </p>
+            </article>
+
+            <article className="rounded-xl border border-slate-800 bg-[#0a1728] p-4">
+              <p className="text-xs text-slate-400">SOPORTE · 20 VELAS</p>
+              <p className="mt-2 text-lg font-bold">{money(result.support)}</p>
+            </article>
           </div>
         </section>
 
-        <footer
-          style={{
-            marginTop:
-              "28px",
-            padding:
-              "20px 0",
-            color:
-              "#596372",
-            fontSize:
-              "12px",
-            textAlign:
-              "center",
-          }}
-        >
-          Nexus Trader AI · Market analysis and education platform
-        </footer>
+        <p className="pb-4 text-xs leading-5 text-slate-500">
+          Las señales son orientativas, no garantías de resultado. M3 y M4 se
+          calculan agrupando velas de un minuto. La actualización consulta la
+          API cada 30 segundos, pero el precio solo cambia cuando llegan datos
+          nuevos del proveedor. Verifica los precios antes de operar.
+        </p>
       </div>
     </main>
   );
